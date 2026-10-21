@@ -134,11 +134,11 @@ st.caption("Historical loan disbursements, staff portfolio indicators, and short
 
 with st.sidebar:
     st.header("Data source")
-    uploaded = st.file_uploader("Upload the bank's General Report (.xlsx)", type=["xlsx"])
+    uploaded = st.file_uploader("Upload your bank's General Report", type=["xlsx"])
     st.caption("The app analyses aggregated data and excludes customer names, phone numbers, customer IDs and loan reference numbers from its working table.")
 
 if uploaded is None:
-    st.info("Upload **General_Report_2026-01-28_to_2026-09-27.xlsx** in the sidebar to begin.")
+    st.info("Upload **General_Report** in the sidebar to begin.")
     st.markdown("**Expected columns:** Loan Amount, Disburse Date, Loan Product, Branch, and RO. Collection and arrears columns are used when present.")
     st.stop()
 
