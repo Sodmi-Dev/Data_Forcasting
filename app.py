@@ -334,16 +334,46 @@ if df.empty:
     st.stop()
 
 with st.sidebar:
-    st.header("Filters")
+    st.header("Interactive filters")
     min_date = df["Disburse Date"].min().date()
     max_date = df["Disburse Date"].max().date()
-    date_range = st.date_input("Disbursement date range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
+
+    date_preset = st.selectbox(
+        "Quick date range",
+        ["All available dates", "Last 30 days in data", "Last 90 days in data", "Custom range"],
+        index=0,
+        key="loan_date_preset",
+    )
+    if date_preset == "Custom range":
+        date_range = st.date_input(
+            "Disbursement date range",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date,
+            key="loan_custom_date_range",
+        )
+    elif date_preset == "Last 30 days in data":
+        date_range = (max(min_date, max_date - pd.Timedelta(days=29)), max_date)
+        st.caption(f"Showing records from {date_range[0]} to {date_range[1]}.")
+    elif date_preset == "Last 90 days in data":
+        date_range = (max(min_date, max_date - pd.Timedelta(days=89)), max_date)
+        st.caption(f"Showing records from {date_range[0]} to {date_range[1]}.")
+    else:
+        date_range = (min_date, max_date)
+
     branches = sorted(df["Branch"].unique().tolist())
-    selected_branches = st.multiselect("Branch", branches, default=branches)
+    selected_branches = st.multiselect("Branch", branches, default=branches, key="filter_branches")
     products = sorted(df["Loan Product"].unique().tolist())
-    selected_products = st.multiselect("Loan product", products, default=products)
+    selected_products = st.multiselect("Loan product", products, default=products, key="filter_products")
     officers = sorted(df["RO"].unique().tolist())
-    selected_officers = st.multiselect("Relationship Officer (RO)", officers, default=officers)
+    selected_officers = st.multiselect("Relationship Officer (RO)", officers, default=officers, key="filter_officers")
+    ro_search = st.text_input("Search RO", placeholder="Type part of an RO name/code…", key="filter_ro_search")
+    if ro_search.strip():
+        selected_officers = [
+            ro for ro in selected_officers
+            if ro_search.strip().casefold() in ro.casefold()
+        ]
+    st.caption("Filters update the selected dashboard section automatically.")
 
 if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
     start_date, end_date = date_range
@@ -378,11 +408,92 @@ k5.metric("Loans with past-due count*", f"{past_due_loans:,}" if past_due_loans 
 st.caption("*Collection, outstanding balance and past-due figures are portfolio snapshot values from the uploaded report, not dated collection transactions. Do not interpret them as collections made during the selected date range.")
 
 st.divider()
-tab_forecast, tab_staff, tab_portfolio, tab_audit, tab_data = st.tabs(
-    ["Forecasting", "Staff performance", "Portfolio monitoring", "Audit trail", "Data checks"]
+st.subheader("Dashboard navigation")
+active_section = st.selectbox(
+    "Choose a dashboard section",
+    [
+        "Executive overview",
+        "Forecasting",
+        "Staff performance",
+        "Portfolio monitoring",
+        "Audit trail",
+        "Data checks",
+    ],
+    key="dashboard_navigation",
 )
+st.caption("Use the navigation dropdown to switch sections. Sidebar filters apply across the loan dashboard.")
 
-with tab_forecast:
+if active_section == "Executive overview":
+    st.subheader("Executive overview")
+    st.write("A filtered snapshot of loan disbursements and portfolio indicators.")
+    overview_cols = st.columns(4)
+    overview_cols[0].metric("Loans in view", f"{len(filtered):,}")
+    overview_cols[1].metric("Total disbursed", fmt_naira(filtered["Loan Amount"].sum()))
+    overview_cols[2].metric(
+        "Loan products",
+        f"{filtered['Loan Product'].nunique():,}",
+    )
+    overview_cols[3].metric("Branches in view", f"{filtered['Branch'].nunique():,}")
+
+    left, right = st.columns(2)
+    with left:
+        product_summary = (
+            filtered.groupby("Loan Product", as_index=False)
+            .agg(Loans=("Loan Amount", "size"), Amount_Disbursed=("Loan Amount", "sum"))
+            .sort_values("Amount_Disbursed", ascending=False)
+        )
+        overview_chart_type = st.selectbox(
+            "Loan product chart",
+            ["Bar chart", "Pie chart"],
+            key="overview_product_chart_type",
+        )
+        if overview_chart_type == "Pie chart":
+            fig_overview = px.pie(
+                product_summary,
+                names="Loan Product",
+                values="Amount_Disbursed",
+                title="Disbursement amount by loan product",
+            )
+        else:
+            fig_overview = px.bar(
+                product_summary,
+                x="Loan Product",
+                y="Amount_Disbursed",
+                title="Disbursement amount by loan product",
+                labels={"Amount_Disbursed": "Amount disbursed (₦)"},
+            )
+        st.plotly_chart(fig_overview, use_container_width=True)
+
+    with right:
+        trend = (
+            filtered.set_index("Disburse Date")["Loan Amount"]
+            .resample("MS")
+            .sum()
+            .rename("Amount disbursed")
+            .reset_index()
+        )
+        fig_trend = px.line(
+            trend,
+            x="Disburse Date",
+            y="Amount disbursed",
+            markers=True,
+            title="Monthly disbursement trend",
+            labels={"Disburse Date": "Month", "Amount disbursed": "Amount (₦)"},
+        )
+        fig_trend.update_yaxes(tickprefix="₦", tickformat=",.0f")
+        st.plotly_chart(fig_trend, use_container_width=True)
+
+    st.markdown("**Filtered loan records**")
+    st.dataframe(filtered, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download filtered loan summary (CSV)",
+        data=filtered.to_csv(index=False).encode("utf-8"),
+        file_name="filtered_loan_summary.csv",
+        mime="text/csv",
+        key="download_overview_csv",
+    )
+
+elif active_section == "Forecasting":
     st.subheader("Time-series forecast")
     st.write("Forecasts are based on the **Disburse Date** and **Loan Amount** in this report. They estimate future disbursement volume, not future repayments or employee visits.")
     c1, c2, c3 = st.columns(3)
@@ -427,7 +538,7 @@ with tab_forecast:
         else:
             st.warning("Unable to create a forecast. Try a wider date range or fewer filters.")
 
-with tab_staff:
+elif active_section == "Staff performance":
     st.subheader("Relationship Officer (RO) performance")
     st.caption("This report supports loan portfolio output analysis by RO. It does not contain daily visit logs, applications received, or follow-up activity records.")
     staff = filtered.groupby("RO", dropna=False).agg(
@@ -461,12 +572,25 @@ with tab_staff:
     csv = staff.to_csv(index=False).encode("utf-8")
     st.download_button("Download RO summary (CSV)", data=csv, file_name="ro_performance_summary.csv", mime="text/csv")
 
-with tab_portfolio:
+elif active_section == "Portfolio monitoring":
     st.subheader("Portfolio monitoring (snapshot indicators)")
     p1, p2 = st.columns(2)
     with p1:
         prod = filtered.groupby("Loan Product").agg(Loans=("Loan Amount", "size"), Amount_Disbursed=("Loan Amount", "sum")).reset_index().sort_values("Amount_Disbursed", ascending=False)
-        fig = px.bar(prod, x="Loan Product", y="Amount_Disbursed", title="Disbursement amount by loan product", labels={"Amount_Disbursed": "Amount disbursed (₦)"})
+        portfolio_chart_type = st.selectbox(
+            "Disbursement chart style",
+            ["Bar chart", "Pie chart"],
+            key="portfolio_chart_style",
+        )
+        if portfolio_chart_type == "Pie chart":
+            fig = px.pie(
+                prod,
+                names="Loan Product",
+                values="Amount_Disbursed",
+                title="Disbursement amount by loan product",
+            )
+        else:
+            fig = px.bar(prod, x="Loan Product", y="Amount_Disbursed", title="Disbursement amount by loan product", labels={"Amount_Disbursed": "Amount disbursed (₦)"})
         st.plotly_chart(fig, use_container_width=True)
     with p2:
         if "Default Amount" in filtered.columns:
@@ -483,7 +607,7 @@ with tab_portfolio:
         st.plotly_chart(fig, use_container_width=True)
     st.caption("Default Amount and Past Due Count are interpreted as values in the supplied report. Confirm the bank's definitions before using them as official delinquency KPIs.")
 
-with tab_audit:
+elif active_section == "Audit trail":
     if audit_load_error:
         st.error(f"Could not read the audit log: {audit_load_error}")
         st.info("Check the audit file format and confirm it contains Who, Entity Type and Created At columns.")
@@ -493,7 +617,7 @@ with tab_audit:
         st.info("Upload the CBA Audit Trail in the sidebar to view audit activity.")
         st.caption("The audit trail can be loaded independently of the General Report.")
 
-with tab_data:
+elif active_section == "Data checks":
     st.subheader("Data checks and coverage")
     info = pd.DataFrame({
         "Check": ["Rows used", "Date range", "Branches", "Relationship Officers", "Loan products", "Missing disbursement dates removed", "Missing loan amounts removed"],
