@@ -36,6 +36,167 @@ def load_report(file_bytes: bytes) -> pd.DataFrame:
     return df
 
 
+
+@st.cache_data(show_spinner=False)
+def load_audit_log(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    """Load only audit fields needed for aggregated monitoring."""
+    if file_name.lower().endswith(".csv"):
+        raw = pd.read_csv(BytesIO(file_bytes))
+    else:
+        raw = pd.read_excel(BytesIO(file_bytes))
+
+    required = ["Who", "Entity Type", "Created At"]
+    missing = [col for col in required if col not in raw.columns]
+    if missing:
+        raise ValueError("Missing required audit column(s): " + ", ".join(missing))
+
+    # Do not carry free-text descriptions, emails, IP addresses, user agents,
+    # or personal names into the dashboard's working table.
+    keep = ["Who", "Entity Type", "Created At"]
+    if "Where" in raw.columns:
+        keep.append("Where")
+    audit = raw[keep].copy()
+
+    audit["Created At"] = pd.to_datetime(audit["Created At"], errors="coerce")
+    audit = audit.dropna(subset=["Created At"])
+    for col in ["Who", "Entity Type"] + (["Where"] if "Where" in audit.columns else []):
+        audit[col] = (
+            audit[col].fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
+        )
+    return audit
+
+
+def render_audit_dashboard(audit_df: pd.DataFrame) -> None:
+    """Render aggregate audit monitoring without exposing raw transaction details."""
+    st.subheader("Audit Trail & Activity Monitoring")
+    st.caption(
+        "Aggregated activity only. Raw event descriptions, personal names, email addresses, "
+        "IP addresses and browser identifiers are not displayed."
+    )
+
+    if audit_df.empty:
+        st.warning("No valid audit events were found after parsing event timestamps.")
+        return
+
+    min_date = audit_df["Created At"].min().date()
+    max_date = audit_df["Created At"].max().date()
+    date_range = st.date_input(
+        "Audit event date range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+        key="audit_date_range",
+    )
+
+    if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+        start_date, end_date = date_range
+        filtered_audit = audit_df[
+            audit_df["Created At"].dt.date.between(start_date, end_date)
+        ].copy()
+    else:
+        filtered_audit = audit_df.iloc[0:0].copy()
+
+    entity_values = sorted(filtered_audit["Entity Type"].unique().tolist())
+    selected_entities = st.multiselect(
+        "Activity category",
+        entity_values,
+        default=entity_values,
+        key="audit_entity_types",
+    )
+    filtered_audit = filtered_audit[
+        filtered_audit["Entity Type"].isin(selected_entities)
+    ].copy()
+
+    filtered_audit["_Actor class"] = np.where(
+        filtered_audit["Who"].str.strip().str.lower().eq("system"),
+        "Explicit system",
+        "Other / unidentified actor",
+    )
+    actor_classes = ["Explicit system", "Other / unidentified actor"]
+    available_actor_classes = [
+        label for label in actor_classes
+        if label in filtered_audit["_Actor class"].unique()
+    ]
+    selected_actor_classes = st.multiselect(
+        "Actor class",
+        available_actor_classes,
+        default=available_actor_classes,
+        key="audit_actor_classes",
+    )
+    filtered_audit = filtered_audit[
+        filtered_audit["_Actor class"].isin(selected_actor_classes)
+    ].copy()
+
+    if filtered_audit.empty:
+        st.info("No audit events match the selected filters.")
+        return
+
+    system_mask = filtered_audit["_Actor class"].eq("Explicit system")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Audit events", f"{len(filtered_audit):,}")
+    k2.metric("Activity categories", f"{filtered_audit['Entity Type'].nunique():,}")
+    k3.metric("Distinct actors", f"{filtered_audit['Who'].nunique():,}")
+    k4.metric("Explicit system events", f"{int(system_mask.sum()):,}")
+
+    left, right = st.columns(2)
+    with left:
+        category_counts = (
+            filtered_audit["Entity Type"].value_counts()
+            .rename_axis("Activity category")
+            .reset_index(name="Events")
+        )
+        fig_category = px.bar(
+            category_counts,
+            x="Activity category",
+            y="Events",
+            title="Events by activity category",
+        )
+        fig_category.update_layout(height=400, xaxis_tickangle=-30)
+        st.plotly_chart(fig_category, use_container_width=True)
+
+    with right:
+        daily = (
+            filtered_audit.set_index("Created At")
+            .resample("D")
+            .size()
+            .rename("Events")
+            .reset_index()
+        )
+        fig_daily = px.line(
+            daily,
+            x="Created At",
+            y="Events",
+            title="Daily audit event volume",
+            markers=True,
+        )
+        fig_daily.update_layout(height=400)
+        st.plotly_chart(fig_daily, use_container_width=True)
+
+    actor_breakdown = pd.DataFrame(
+        {
+            "Actor class": ["Explicit system", "Other / unidentified actor"],
+            "Events": [int(system_mask.sum()), int((~system_mask).sum())],
+        }
+    )
+    st.plotly_chart(
+        px.bar(actor_breakdown, x="Actor class", y="Events", title="System vs other events"),
+        use_container_width=True,
+    )
+
+    st.subheader("Recent activity summary")
+    # No names, emails, IP addresses, user-agent strings or free-text event descriptions.
+    safe = filtered_audit[["Created At", "Entity Type"]].copy()
+    safe["Actor class"] = filtered_audit["_Actor class"]
+    if "Where" in filtered_audit.columns:
+        safe["Application area"] = filtered_audit["Where"].astype(str)
+    safe = safe.sort_values("Created At", ascending=False).head(20)
+    st.dataframe(safe, use_container_width=True, hide_index=True)
+    st.caption(
+        "The 'system' label is based only on the literal Who value. Other actors are not "
+        "necessarily employees, and this view does not determine whether an event was authorised."
+    )
+
+
 def fmt_naira(value) -> str:
     if pd.isna(value):
         return "—"
@@ -133,13 +294,33 @@ st.title("📊 Microcredit Forecasting & Staff Performance")
 st.caption("Historical loan disbursements, staff portfolio indicators, and short-term time-series forecasts.")
 
 with st.sidebar:
-    st.header("Data source")
-    uploaded = st.file_uploader("Upload your bank's General Report", type=["xlsx"])
-    st.caption("The app analyses aggregated data and excludes customer names, phone numbers, customer IDs and loan reference numbers from its working table.")
+    st.header("Data sources")
+    uploaded = st.file_uploader("Upload your bank's General Report", type=["xlsx"], key="loan_report_upload")
+    activity_file = st.file_uploader(
+        "Upload CBA Audit Trail",
+        type=["xlsx", "csv"],
+        key="audit_trail_upload",
+    )
+    st.caption("Loan reporting excludes customer identifiers from its working table.")
+    st.caption("Audit monitoring uses aggregated fields and does not display raw event descriptions, names, emails, IP addresses or browser identifiers.")
+
+audit_df = None
+audit_load_error = None
+if activity_file is not None:
+    try:
+        audit_df = load_audit_log(activity_file.getvalue(), activity_file.name)
+    except Exception as exc:
+        audit_load_error = str(exc)
+
 
 if uploaded is None:
-    st.info("Upload **General_Report** in the sidebar to begin.")
-    st.markdown("**Expected columns:** Loan Amount, Disburse Date, Loan Product, Branch, and RO. Collection and arrears columns are used when present.")
+    st.info("Upload **General_Report** to use forecasting and portfolio analysis. You can still use the audit section independently.")
+    if audit_load_error:
+        st.error(f"Could not read the audit log: {audit_load_error}")
+    elif audit_df is not None:
+        render_audit_dashboard(audit_df)
+    else:
+        st.markdown("Upload the General Report or the CBA Audit Trail in the sidebar to begin.")
     st.stop()
 
 try:
@@ -197,7 +378,9 @@ k5.metric("Loans with past-due count*", f"{past_due_loans:,}" if past_due_loans 
 st.caption("*Collection, outstanding balance and past-due figures are portfolio snapshot values from the uploaded report, not dated collection transactions. Do not interpret them as collections made during the selected date range.")
 
 st.divider()
-tab_forecast, tab_staff, tab_portfolio, tab_data = st.tabs(["Forecasting", "Staff performance", "Portfolio monitoring", "Data checks"])
+tab_forecast, tab_staff, tab_portfolio, tab_audit, tab_data = st.tabs(
+    ["Forecasting", "Staff performance", "Portfolio monitoring", "Audit trail", "Data checks"]
+)
 
 with tab_forecast:
     st.subheader("Time-series forecast")
@@ -299,6 +482,16 @@ with tab_portfolio:
         fig = px.pie(counts, names="Status", values="Loan count", title="Loans by past-due-count indicator")
         st.plotly_chart(fig, use_container_width=True)
     st.caption("Default Amount and Past Due Count are interpreted as values in the supplied report. Confirm the bank's definitions before using them as official delinquency KPIs.")
+
+with tab_audit:
+    if audit_load_error:
+        st.error(f"Could not read the audit log: {audit_load_error}")
+        st.info("Check the audit file format and confirm it contains Who, Entity Type and Created At columns.")
+    elif audit_df is not None:
+        render_audit_dashboard(audit_df)
+    else:
+        st.info("Upload the CBA Audit Trail in the sidebar to view audit activity.")
+        st.caption("The audit trail can be loaded independently of the General Report.")
 
 with tab_data:
     st.subheader("Data checks and coverage")
